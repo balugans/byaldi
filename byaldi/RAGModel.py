@@ -37,6 +37,7 @@ class RAGMultiModalModel:
         cls,
         pretrained_model_name_or_path: Union[str, Path],
         device: str = "cuda",
+        verbose: int = 1,
     ):
         """Load a ColPali model from a pre-trained checkpoint.
 
@@ -49,7 +50,7 @@ class RAGMultiModalModel:
         """
         instance = cls()
         instance.model = ColPaliModel.from_pretrained(
-            pretrained_model_name_or_path, device=device
+            pretrained_model_name_or_path, device=device, verbose=verbose
         )
         return instance
 
@@ -59,6 +60,7 @@ class RAGMultiModalModel:
         index_path: Union[str, Path],
         index_root: str = ".byaldi",
         device: str = "cuda",
+        verbose: int = 1,
     ):
         """Load an Index and the associated ColPali model from an existing document index.
 
@@ -72,7 +74,7 @@ class RAGMultiModalModel:
         instance = cls()
         index_path = Path(index_path)
         instance.model = ColPaliModel.from_index(
-            index_path, index_root=index_root, device=device
+            index_path, index_root=index_root, device=device, verbose=verbose
         )
 
         return instance
@@ -90,6 +92,9 @@ class RAGMultiModalModel:
                 List[Dict[str, Union[str, int]]],
             ]
         ] = None,
+        max_image_width: Optional[int] = None,
+        max_image_height: Optional[int] = None,
+        **kwargs,
     ):
         """Build an index from input documents.
 
@@ -106,13 +111,16 @@ class RAGMultiModalModel:
         Returns:
             None
         """
-        self.model.index(
+        return self.model.index(
             input_path,
             index_name,
             doc_ids,
             store_collection_with_index,
             overwrite=overwrite,
             metadata=metadata,
+            max_image_width=max_image_width,
+            max_image_height=max_image_height,
+            **kwargs,
         )
 
     def add_to_index(
@@ -133,7 +141,7 @@ class RAGMultiModalModel:
         Returns:
             None
         """
-        self.model.add_to_index(
+        return self.model.add_to_index(
             input_item, store_collection_with_index, doc_id, metadata=metadata
         )
 
@@ -154,3 +162,6 @@ class RAGMultiModalModel:
             Union[List[Result], List[List[Result]]]: A list of Result objects or a list of lists of Result objects.
         """
         return self.model.search(query, k, return_base64_results)
+
+    def get_doc_ids_to_file_names(self):
+        return self.model.get_doc_ids_to_file_names()
