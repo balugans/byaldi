@@ -1,28 +1,20 @@
 import os
+import shutil
+import tempfile
+from importlib.metadata import version
+from pathlib import Path
+from typing import Dict, List, Optional, Union, cast
+
 import srsly
 import torch
-import shutil
-from typing import Optional, Union, List, Dict
-from pathlib import Path
-from PIL import Image
+from colpali_engine.models import ColPali, ColPaliProcessor
 from pdf2image import convert_from_path
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-from transformers import AutoProcessor
-from colpali_engine.models.paligemma_colbert_architecture import ColPali
-from colpali_engine.trainer.retrieval_evaluator import CustomEvaluator
-from colpali_engine.utils.colpali_processing_utils import (
-    process_images,
-    process_queries,
-)
+from PIL import Image
+
 from byaldi.objects import Result
-from .utils import capture_print
+
 # Import version directly from the package metadata
-from importlib.metadata import version
 VERSION = version("Byaldi")
-
-
-MOCK_IMAGE = Image.new("RGB", (448, 448), (255, 255, 255))
 
 
 class ColPaliModel:
@@ -37,18 +29,29 @@ class ColPaliModel:
         device: Optional[Union[str, torch.device]] = None,
         **kwargs,
     ):
+        if isinstance(pretrained_model_name_or_path, Path):
+            pretrained_model_name_or_path = str(pretrained_model_name_or_path)
+
         if "colpali" not in pretrained_model_name_or_path.lower():
             raise ValueError(
                 "This pre-release version of Byaldi only supports ColPali for now. Incorrect model name specified."
             )
 
         if verbose > 0:
-            print(f"Verbosity is set to {verbose} ({'active' if verbose == 1 else 'loud'}). Pass verbose=0 to make quieter.")
+            print(
+                f"Verbosity is set to {verbose} ({'active' if verbose == 1 else 'loud'}). Pass verbose=0 to make quieter."
+            )
 
         self.pretrained_model_name_or_path = pretrained_model_name_or_path
         self.model_name = self.pretrained_model_name_or_path
         self.n_gpu = torch.cuda.device_count() if n_gpu == -1 else n_gpu
-        device = device or "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+        device = (
+            device or "cuda"
+            if torch.cuda.is_available()
+            else "mps"
+            if torch.backends.mps.is_available()
+            else "cpu"
+        )
         self.index_name = index_name
         self.verbose = verbose
         self.load_from_index = load_from_index
@@ -61,37 +64,27 @@ class ColPaliModel:
         self.doc_ids_to_file_names = {}
         self.doc_ids = set()
 
-        # self.model = ColPali.from_pretrained(
-        #     "vidore/colpaligemma-3b-pt-448-base",
-        #     torch_dtype=torch.bfloat16,
-        #     device_map="cuda"
-        #     if device == "cuda"
-        #     or (isinstance(device, torch.device) and device.type == "cuda")
-        #     else None,
-        #     token=kwargs.get("hf_token", None) or os.environ.get("HF_TOKEN"),
-        # )
-
-
-        # if verbose > 0:
-        #     print("Loading adapter...")
-        #     print("Adapter name: ", self.pretrained_model_name_or_path)
-        # self.model.load_adapter(self.pretrained_model_name_or_path)
-
-
         self.model = ColPali.from_pretrained(
             self.pretrained_model_name_or_path,
             torch_dtype=torch.bfloat16,
-            device_map="cuda"
-            if device == "cuda"
-            or (isinstance(device, torch.device) and device.type == "cuda")
-            else None,
+            device_map=(
+                "cuda"
+                if device == "cuda"
+                or (isinstance(device, torch.device) and device.type == "cuda")
+                else None
+            ),
             token=kwargs.get("hf_token", None) or os.environ.get("HF_TOKEN"),
         )
         self.model = self.model.eval()
-        self.processor = AutoProcessor.from_pretrained(
-            self.pretrained_model_name_or_path,
-            token=kwargs.get("hf_token", None) or os.environ.get("HF_TOKEN"),
+
+        self.processor = cast(
+            ColPaliProcessor,
+            ColPaliProcessor.from_pretrained(
+                self.pretrained_model_name_or_path,
+                token=kwargs.get("hf_token", None) or os.environ.get("HF_TOKEN"),
+            ),
         )
+
         self.device = device
         if device != "cuda" and not (
             isinstance(device, torch.device) and device.type == "cuda"
@@ -102,7 +95,10 @@ class ColPaliModel:
             self.full_document_collection = False
             self.highest_doc_id = -1
         else:
-            index_path = Path(index_root) / Path(index_name)
+            if self.index_name is None:
+                raise ValueError("No index name specified. Cannot load from index.")
+
+            index_path = Path(index_root) / Path(self.index_name)
             index_config = srsly.read_gzip_json(index_path / "index_config.json.gz")
             self.full_document_collection = index_config.get(
                 "full_document_collection", False
@@ -110,10 +106,12 @@ class ColPaliModel:
             self.resize_stored_images = index_config.get("resize_stored_images", False)
             self.max_image_width = index_config.get("max_image_width", None)
             self.max_image_height = index_config.get("max_image_height", None)
+
             if self.full_document_collection:
                 collection_path = index_path / "collection"
                 json_files = sorted(
-                    collection_path.glob("*.json.gz"), key=lambda x: int(x.stem.split('.')[0])
+                    collection_path.glob("*.json.gz"),
+                    key=lambda x: int(x.stem.split(".")[0]),
                 )
 
                 for json_file in json_files:
@@ -132,20 +130,35 @@ class ColPaliModel:
                     )
 
             embeddings_path = index_path / "embeddings"
-            embedding_files = sorted(embeddings_path.glob("embeddings_*.pt"), key=lambda x: int(x.stem.split('_')[1]))
+            embedding_files = sorted(
+                embeddings_path.glob("embeddings_*.pt"),
+                key=lambda x: int(x.stem.split("_")[1]),
+            )
             self.indexed_embeddings = []
             for file in embedding_files:
                 self.indexed_embeddings.extend(torch.load(file))
 
-            self.embed_id_to_doc_id = srsly.read_gzip_json(index_path / "embed_id_to_doc_id.json.gz")
+            self.embed_id_to_doc_id = srsly.read_gzip_json(
+                index_path / "embed_id_to_doc_id.json.gz"
+            )
             # Restore keys to integers
-            self.embed_id_to_doc_id = {int(k): v for k, v in self.embed_id_to_doc_id.items()}
-            self.highest_doc_id = max(int(entry["doc_id"]) for entry in self.embed_id_to_doc_id.values())
-            self.doc_ids = set(int(entry["doc_id"]) for entry in self.embed_id_to_doc_id.values())
+            self.embed_id_to_doc_id = {
+                int(k): v for k, v in self.embed_id_to_doc_id.items()
+            }
+            self.highest_doc_id = max(
+                int(entry["doc_id"]) for entry in self.embed_id_to_doc_id.values()
+            )
+            self.doc_ids = set(
+                int(entry["doc_id"]) for entry in self.embed_id_to_doc_id.values()
+            )
             try:
                 # We don't want this error out with indexes created prior to 0.0.2
-                self.doc_ids_to_file_names = srsly.read_gzip_json(index_path / "doc_ids_to_file_names.json.gz")
-                self.doc_ids_to_file_names = {int(k): v for k, v in self.doc_ids_to_file_names.items()}
+                self.doc_ids_to_file_names = srsly.read_gzip_json(
+                    index_path / "doc_ids_to_file_names.json.gz"
+                )
+                self.doc_ids_to_file_names = {
+                    int(k): v for k, v in self.doc_ids_to_file_names.items()
+                }
             except FileNotFoundError:
                 pass
 
@@ -154,7 +167,9 @@ class ColPaliModel:
             if metadata_path.exists():
                 self.doc_id_to_metadata = srsly.read_gzip_json(metadata_path)
                 # Convert metadata keys to integers
-                self.doc_id_to_metadata = {int(k): v for k, v in self.doc_id_to_metadata.items()}
+                self.doc_id_to_metadata = {
+                    int(k): v for k, v in self.doc_id_to_metadata.items()
+                }
             else:
                 self.doc_id_to_metadata = {}
 
@@ -165,6 +180,7 @@ class ColPaliModel:
         n_gpu: int = -1,
         verbose: int = 1,
         device: Optional[Union[str, torch.device]] = None,
+        index_root: str = ".byaldi",
         **kwargs,
     ):
         return cls(
@@ -172,6 +188,7 @@ class ColPaliModel:
             n_gpu=n_gpu,
             verbose=verbose,
             load_from_index=False,
+            index_root=index_root,
             device=device,
             **kwargs,
         )
@@ -186,7 +203,7 @@ class ColPaliModel:
         index_root: str = ".byaldi",
         **kwargs,
     ):
-        index_path = Path(index_root) /  Path(index_path)
+        index_path = Path(index_root) / Path(index_path)
         index_config = srsly.read_gzip_json(index_path / "index_config.json.gz")
 
         instance = cls(
@@ -215,7 +232,7 @@ class ColPaliModel:
         num_embeddings = len(self.indexed_embeddings)
         chunk_size = 500
         for i in range(0, num_embeddings, chunk_size):
-            chunk = self.indexed_embeddings[i:i+chunk_size]
+            chunk = self.indexed_embeddings[i : i + chunk_size]
             torch.save(chunk, embeddings_path / f"embeddings_{i}.pt")
 
         # Save index config
@@ -223,7 +240,9 @@ class ColPaliModel:
             "model_name": self.model_name,
             "full_document_collection": self.full_document_collection,
             "highest_doc_id": self.highest_doc_id,
-            "resize_stored_images": True if self.max_image_width and self.max_image_height else False,
+            "resize_stored_images": True
+            if self.max_image_width and self.max_image_height
+            else False,
             "max_image_width": self.max_image_width,
             "max_image_height": self.max_image_height,
             "library_version": VERSION,
@@ -231,10 +250,14 @@ class ColPaliModel:
         srsly.write_gzip_json(index_path / "index_config.json.gz", index_config)
 
         # Save embed_id_to_doc_id mapping
-        srsly.write_gzip_json(index_path / "embed_id_to_doc_id.json.gz", self.embed_id_to_doc_id)
+        srsly.write_gzip_json(
+            index_path / "embed_id_to_doc_id.json.gz", self.embed_id_to_doc_id
+        )
 
         # Save doc_ids_to_file_names
-        srsly.write_gzip_json(index_path / "doc_ids_to_file_names.json.gz", self.doc_ids_to_file_names)
+        srsly.write_gzip_json(
+            index_path / "doc_ids_to_file_names.json.gz", self.doc_ids_to_file_names
+        )
 
         # Save metadata
         srsly.write_gzip_json(index_path / "metadata.json.gz", self.doc_id_to_metadata)
@@ -249,7 +272,7 @@ class ColPaliModel:
 
         if self.verbose > 0:
             print(f"Index exported to {index_path}")
-            
+
     def index(
         self,
         input_path: Union[str, Path],
@@ -277,18 +300,22 @@ class ColPaliModel:
             raise ValueError("index_name must be specified to create a new index.")
         if store_collection_with_index:
             self.full_document_collection = True
-        
+
         index_path = Path(self.index_root) / Path(index_name)
         if index_path.exists():
             if overwrite is False:
-                raise ValueError(f"An index named {index_name} already exists.", 
-                                 "Use overwrite=True to delete the existing index and build a new one.",
-                                 "Exiting indexing without doing anything...")
+                raise ValueError(
+                    f"An index named {index_name} already exists.",
+                    "Use overwrite=True to delete the existing index and build a new one.",
+                    "Exiting indexing without doing anything...",
+                )
                 return None
             else:
-                print(f"overwrite is on. Deleting existing index {index_name} to build a new one.")
+                print(
+                    f"overwrite is on. Deleting existing index {index_name} to build a new one."
+                )
                 shutil.rmtree(index_path)
-        
+
         self.index_name = index_name
         self.max_image_width = max_image_width
         self.max_image_height = max_image_height
@@ -311,19 +338,31 @@ class ColPaliModel:
                 print(f"Indexing file: {item}")
                 doc_id = doc_ids[i] if doc_ids else self.highest_doc_id + 1
                 doc_metadata = metadata[doc_id] if metadata else None
-                self.add_to_index(item, store_collection_with_index, doc_id=doc_id, metadata=doc_metadata)
+                self.add_to_index(
+                    item,
+                    store_collection_with_index,
+                    doc_id=doc_id,
+                    metadata=doc_metadata,
+                )
                 self.doc_ids_to_file_names[doc_id] = str(item)
         else:
             if metadata is not None and len(metadata) != 1:
-                raise ValueError("For a single document, metadata should be a list with one dictionary")
+                raise ValueError(
+                    "For a single document, metadata should be a list with one dictionary"
+                )
             doc_id = doc_ids[0] if doc_ids else self.highest_doc_id + 1
             doc_metadata = metadata[0] if metadata else None
-            self.add_to_index(input_path, store_collection_with_index, doc_id=doc_id, metadata=doc_metadata)
+            self.add_to_index(
+                input_path,
+                store_collection_with_index,
+                doc_id=doc_id,
+                metadata=doc_metadata,
+            )
             self.doc_ids_to_file_names[doc_id] = str(input_path)
 
         self._export_index()
         return self.doc_ids_to_file_names
-        
+
     def add_to_index(
         self,
         input_item: Union[str, Path, Image.Image, List[Union[str, Path, Image.Image]]],
@@ -332,22 +371,34 @@ class ColPaliModel:
         metadata: Optional[List[Dict[str, Union[str, int]]]] = None,
     ) -> Dict[int, str]:
         if self.index_name is None:
-            raise ValueError("No index loaded. Use index() to create or load an index first.")
+            raise ValueError(
+                "No index loaded. Use index() to create or load an index first."
+            )
         if not hasattr(self, "highest_doc_id"):
             self.highest_doc_id = -1
         # Convert single inputs to lists for uniform processing
         if isinstance(input_item, (str, Path)) and Path(input_item).is_dir():
             input_items = list(Path(input_item).iterdir())
         else:
-            input_items = [input_item] if not isinstance(input_item, list) else input_item
-    
-        doc_ids = [doc_id] if isinstance(doc_id, int) else (doc_id if doc_id is not None else None)
+            input_items = (
+                [input_item] if not isinstance(input_item, list) else input_item
+            )
+
+        doc_ids = (
+            [doc_id]
+            if isinstance(doc_id, int)
+            else (doc_id if doc_id is not None else None)
+        )
 
         # Validate input lengths
         if doc_ids and len(doc_ids) != len(input_items):
-            raise ValueError(f"Number of doc_ids ({len(doc_ids)}) does not match number of input items ({len(input_items)})")
+            raise ValueError(
+                f"Number of doc_ids ({len(doc_ids)}) does not match number of input items ({len(input_items)})"
+            )
         if metadata and len(metadata) != len(input_items):
-            raise ValueError(f"Number of metadata entries ({len(metadata)}) does not match number of input items ({len(input_items)})")
+            raise ValueError(
+                f"Number of metadata entries ({len(metadata)}) does not match number of input items ({len(input_items)})"
+            )
 
         # Process each input item
         for i, item in enumerate(input_items):
@@ -355,19 +406,33 @@ class ColPaliModel:
             current_metadata = metadata[i] if metadata else None
 
             if current_doc_id in self.doc_ids:
-                raise ValueError(f"Document ID {current_doc_id} already exists in the index")
+                raise ValueError(
+                    f"Document ID {current_doc_id} already exists in the index"
+                )
 
             self.highest_doc_id = max(self.highest_doc_id, current_doc_id)
 
             if isinstance(item, (str, Path)):
                 item_path = Path(item)
                 if item_path.is_dir():
-                    self._process_directory(item_path, store_collection_with_index, current_doc_id, current_metadata)
+                    self._process_directory(
+                        item_path,
+                        store_collection_with_index,
+                        current_doc_id,
+                        current_metadata,
+                    )
                 else:
-                    self._process_and_add_to_index(item_path, store_collection_with_index, current_doc_id, current_metadata)
+                    self._process_and_add_to_index(
+                        item_path,
+                        store_collection_with_index,
+                        current_doc_id,
+                        current_metadata,
+                    )
                 self.doc_ids_to_file_names[current_doc_id] = str(item_path)
             elif isinstance(item, Image.Image):
-                self._process_and_add_to_index(item, store_collection_with_index, current_doc_id, current_metadata)
+                self._process_and_add_to_index(
+                    item, store_collection_with_index, current_doc_id, current_metadata
+                )
                 self.doc_ids_to_file_names[current_doc_id] = "In-memory Image"
             else:
                 raise ValueError(f"Unsupported input type: {type(item)}")
@@ -375,11 +440,19 @@ class ColPaliModel:
         self._export_index()
         return self.doc_ids_to_file_names
 
-    def _process_directory(self, directory: Path, store_collection_with_index: bool, base_doc_id: int, metadata: Optional[Dict[str, Union[str, int]]]):
+    def _process_directory(
+        self,
+        directory: Path,
+        store_collection_with_index: bool,
+        base_doc_id: int,
+        metadata: Optional[Dict[str, Union[str, int]]],
+    ):
         for i, item in enumerate(directory.iterdir()):
             print(f"Indexing file: {item}")
             current_doc_id = base_doc_id + i
-            self._process_and_add_to_index(item, store_collection_with_index, current_doc_id, metadata)
+            self._process_and_add_to_index(
+                item, store_collection_with_index, current_doc_id, metadata
+            )
             self.doc_ids_to_file_names[current_doc_id] = str(item)
 
     def _process_and_add_to_index(
@@ -392,16 +465,33 @@ class ColPaliModel:
         """TODO: THERE ARE TOO MANY FUNCTIONS DOING THINGS HERE. I blame Claude, but this is temporary anyway."""
         if isinstance(item, Path):
             if item.suffix.lower() == ".pdf":
-                images = convert_from_path(item)
-                for i, image in enumerate(images):
-                    self._add_to_index(image, store_collection_with_index, doc_id, page_id=i + 1, metadata=metadata)
+                with tempfile.TemporaryDirectory() as path:
+                    images = convert_from_path(
+                        item,
+                        thread_count=os.cpu_count()-1,
+                        output_folder=path,
+                        paths_only=True
+                    )
+                    for i, image_path in enumerate(images):
+                        image = Image.open(image_path)
+                        self._add_to_index(
+                            image,
+                            store_collection_with_index,
+                            doc_id,
+                            page_id=i + 1,
+                            metadata=metadata,
+                        )
             elif item.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]:
                 image = Image.open(item)
-                self._add_to_index(image, store_collection_with_index, doc_id, metadata=metadata)
+                self._add_to_index(
+                    image, store_collection_with_index, doc_id, metadata=metadata
+                )
             else:
                 raise ValueError(f"Unsupported input type: {item.suffix}")
         elif isinstance(item, Image.Image):
-            self._add_to_index(item, store_collection_with_index, doc_id, metadata=metadata)
+            self._add_to_index(
+                item, store_collection_with_index, doc_id, metadata=metadata
+            )
         else:
             raise ValueError(f"Unsupported input type: {type(item)}")
 
@@ -413,10 +503,15 @@ class ColPaliModel:
         page_id: int = 1,
         metadata: Optional[Dict[str, Union[str, int]]] = None,
     ):
-        if any(entry["doc_id"] == doc_id and entry["page_id"] == page_id for entry in self.embed_id_to_doc_id.values()):
-            raise ValueError(f"Document ID {doc_id} with page ID {page_id} already exists in the index")
+        if any(
+            entry["doc_id"] == doc_id and entry["page_id"] == page_id
+            for entry in self.embed_id_to_doc_id.values()
+        ):
+            raise ValueError(
+                f"Document ID {doc_id} with page ID {page_id} already exists in the index"
+            )
 
-        processed_image = process_images(self.processor, [image])
+        processed_image = self.processor.process_images([image])
 
         # Generate embedding
         with torch.no_grad():
@@ -429,7 +524,10 @@ class ColPaliModel:
         self.embed_id_to_doc_id[embed_id] = {"doc_id": doc_id, "page_id": int(page_id)}
 
         # Update highest_doc_id
-        self.highest_doc_id = max(self.highest_doc_id, int(doc_id) if isinstance(doc_id, int) else self.highest_doc_id)
+        self.highest_doc_id = max(
+            self.highest_doc_id,
+            int(doc_id) if isinstance(doc_id, int) else self.highest_doc_id,
+        )
 
         if store_collection_with_index:
             import base64
@@ -449,9 +547,11 @@ class ColPaliModel:
                     new_height = self.max_image_height
                     new_width = int(new_height * aspect_ratio)
                 if self.verbose > 2:
-                    print(f"Resizing image to {new_width}x{new_height}" ,
-                          f"(aspect ratio {aspect_ratio:.2f}, original size {img_width}x{img_height},"
-                          f"compression {new_width/img_width * new_height/img_height:.2f})")
+                    print(
+                        f"Resizing image to {new_width}x{new_height}",
+                        f"(aspect ratio {aspect_ratio:.2f}, original size {img_width}x{img_height},"
+                        f"compression {new_width/img_width * new_height/img_height:.2f})",
+                    )
                 image = image.resize((new_width, new_height), Image.LANCZOS)
 
             buffered = io.BytesIO()
@@ -469,12 +569,6 @@ class ColPaliModel:
 
     def remove_from_index(self):
         raise NotImplementedError("This method is not implemented yet.")
-
-    @capture_print
-    def _score(self, qs: torch.Tensor):
-        retriever_evaluator = CustomEvaluator(is_multi_vector=True)
-        scores = retriever_evaluator.evaluate(qs, self.indexed_embeddings)
-        return scores
 
     def search(
         self,
@@ -499,13 +593,13 @@ class ColPaliModel:
         for q in queries:
             # Process query
             with torch.no_grad():
-                batch_query = process_queries(self.processor, [q], MOCK_IMAGE)
+                batch_query = self.processor.process_queries([q])
                 batch_query = {k: v.to(self.device) for k, v in batch_query.items()}
                 embeddings_query = self.model(**batch_query)
             qs = list(torch.unbind(embeddings_query.to("cpu")))
 
             # Compute scores
-            scores = self._score(qs)
+            scores = self.processor.score(qs, self.indexed_embeddings).cpu().numpy()
 
             # Get top k relevant pages
             top_pages = scores.argsort(axis=1)[0][-k:][::-1].tolist()
@@ -529,12 +623,14 @@ class ColPaliModel:
 
         return results[0] if isinstance(query, str) else results
 
-    def encode_image(self, input_data: Union[str, Image.Image, List[Union[str, Image.Image]]]) -> torch.Tensor:
+    def encode_image(
+        self, input_data: Union[str, Image.Image, List[Union[str, Image.Image]]]
+    ) -> torch.Tensor:
         """
         Compute embeddings for one or more images, PDFs, folders, or image files.
 
         Args:
-            input_data (Union[str, Image.Image, List[Union[str, Image.Image]]]): 
+            input_data (Union[str, Image.Image, List[Union[str, Image.Image]]]):
                 A single image, PDF path, folder path, image file path, or a list of these.
 
         Returns:
@@ -551,13 +647,22 @@ class ColPaliModel:
                 if os.path.isdir(item):
                     # Process folder
                     for file in os.listdir(item):
-                        if file.lower().endswith(('.png', '.jpg', '.jpeg', '.tiff', '.bmp', '.gif')):
+                        if file.lower().endswith(
+                            (".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".gif")
+                        ):
                             images.append(Image.open(os.path.join(item, file)))
-                elif item.lower().endswith('.pdf'):
+                elif item.lower().endswith(".pdf"):
                     # Process PDF
-                    pdf_images = convert_from_path(item)
-                    images.extend(pdf_images)
-                elif item.lower().endswith(('.png', '.jpg', '.jpeg', '.tiff', '.bmp', '.gif')):
+                    with tempfile.TemporaryDirectory() as path:
+                        pdf_images = convert_from_path(
+                            item,
+                            thread_count=os.cpu_count()-1,
+                            output_folder=path
+                        )
+                        images.extend(pdf_images)
+                elif item.lower().endswith(
+                    (".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".gif")
+                ):
                     # Process image file
                     images.append(Image.open(item))
                 else:
@@ -566,7 +671,7 @@ class ColPaliModel:
                 raise ValueError(f"Unsupported input type: {type(item)}")
 
         with torch.no_grad():
-            batch = process_images(self.processor, images)
+            batch = self.processor.process_images(images)
             batch = {k: v.to(self.device) for k, v in batch.items()}
             embeddings = self.model(**batch)
 
@@ -577,7 +682,7 @@ class ColPaliModel:
         Compute embeddings for one or more text queries.
 
         Args:
-            query (Union[str, List[str]]): 
+            query (Union[str, List[str]]):
                 A single text query or a list of text queries.
 
         Returns:
@@ -587,7 +692,7 @@ class ColPaliModel:
             query = [query]
 
         with torch.no_grad():
-            batch = process_queries(self.processor, query, MOCK_IMAGE)
+            batch = self.processor.process_queries(query)
             batch = {k: v.to(self.device) for k, v in batch.items()}
             embeddings = self.model(**batch)
 

@@ -59,7 +59,8 @@ Loading a model with `byaldi` is extremely straightforward:
 
 ```python3
 from byaldi import RAGMultiModalModel
-RAG = RAGMultiModalModel.from_pretrained("vidore/colpali")
+# Optionally, you can specify an `index_root`, which is where it'll save the index. It defaults to ".byaldi/".
+RAG = RAGMultiModalModel.from_pretrained("vidore/colpali-v1.2")
 ```
 
 If you've already got an index, and wish to load it along with the model necessary to query it, you can do so just as easily:
@@ -75,8 +76,8 @@ Creating an index with `byaldi` is simple and flexible. **You can index a single
 
 ```python3
 from byaldi import RAGMultiModalModel
-RAG = RAGMultiModalModel.from_pretrained("vidore/colpali")
-# Optionally, you can specify an `index_root`, which is where it'll look for the index. It defaults to ".byaldi/".
+# Optionally, you can specify an `index_root`, which is where it'll save the index. It defaults to ".byaldi/".
+RAG = RAGMultiModalModel.from_pretrained("vidore/colpali-v1.2")
 RAG.index(
     input_path="docs/", # The path to your documents
     index_name=index_name, # The name you want to give to your index. It'll be saved at `index_root/index_name/`.
